@@ -42,6 +42,9 @@ class Heater:
         self.lock = threading.Lock()
         self.last_temp = self.smoothed_temp = self.target_temp = 0.
         self.last_temp_time = 0.
+        # Heat at controlled rate.
+        self.ramp_rate = 0.  # In degrees per hour
+        self.ramp_start_time = self.ramp_start_temp = self.ramp_target = 0.
         # pwm caching
         self.next_pwm_time = 0.
         self.last_pwm_value = 0.
@@ -85,6 +88,15 @@ class Heater:
             time_diff = read_time - self.last_temp_time
             self.last_temp = temp
             self.last_temp_time = read_time
+            if self.ramp_target:
+                ramp_hours = (read_time - self.ramp_start_time) / 3600
+                min_or_max = min if self.ramp_target > self.target_temp else max
+                self.target_temp = min_or_max(
+                    self.ramp_start_temp + self.ramp_rate * ramp_hours,
+                    self.ramp_target
+                )
+                if self.target_temp == self.ramp_target:
+                    self.ramp_rate = self.ramp_target = self.ramp_start_time = self.ramp_start_temp = 0.
             self.control.temperature_update(read_time, temp, self.target_temp)
             temp_diff = temp - self.smoothed_temp
             adj_time = min(time_diff * self.inv_smooth_time, 1.)
@@ -102,19 +114,35 @@ class Heater:
         return self.max_power
     def get_smooth_time(self):
         return self.smooth_time
-    def set_temp(self, degrees):
+    def set_temp(self, degrees, rate=0.):
         if degrees and (degrees < self.min_temp or degrees > self.max_temp):
             raise self.printer.command_error(
                 "Requested temperature (%.1f) out of range (%.1f:%.1f)"
                 % (degrees, self.min_temp, self.max_temp))
         with self.lock:
-            self.target_temp = degrees
+            if rate:
+                if self.ramp_target:
+                    self.ramp_start_temp = self.target_temp
+                elif abs(self.target_temp - self.smoothed_temp) < 5:
+                    self.ramp_start_temp = self.target_temp
+                else:
+                    self.ramp_start_temp = self.smoothed_temp
+                self.ramp_start_time = self.last_temp_time
+                self.target_temp = self.ramp_start_temp
+                self.ramp_target = degrees
+            else:
+                self.target_temp = degrees
+                self.ramp_target = 0.
+            self.ramp_rate = rate
     def get_temp(self, eventtime):
         print_time = self.mcu_pwm.get_mcu().estimated_print_time(eventtime) - 5.
         with self.lock:
             if self.last_temp_time < print_time:
                 return 0., self.target_temp
             return self.smoothed_temp, self.target_temp
+    def get_ramp_target(self):
+        with self.lock:
+            return self.ramp_target
     def check_busy(self, eventtime):
         with self.lock:
             return self.control.check_busy(
@@ -150,8 +178,9 @@ class Heater:
     cmd_SET_HEATER_TEMPERATURE_help = "Sets a heater temperature"
     def cmd_SET_HEATER_TEMPERATURE(self, gcmd):
         temp = gcmd.get_float('TARGET', 0.)
+        rate = gcmd.get_float('RATE', 0.)
         pheaters = self.printer.lookup_object('heaters')
-        pheaters.set_temperature(self, temp)
+        pheaters.set_temperature(self, temp, rate)
 
 
 ######################################################################
@@ -254,6 +283,8 @@ class PrinterHeaters:
         gcode.register_command("M105", self.cmd_M105, when_not_ready=True)
         gcode.register_command("TEMPERATURE_WAIT", self.cmd_TEMPERATURE_WAIT,
                                desc=self.cmd_TEMPERATURE_WAIT_help)
+        gcode.register_command("TEMPERATURE_WAIT_RAMP", self.cmd_TEMPERATURE_WAIT_RAMP,
+                               desc=self.cmd_TEMPERATURE_WAIT_RAMP_help)
     def load_config(self, config):
         self.have_load_sensors = True
         # Load default temperature sensors
@@ -349,10 +380,10 @@ class PrinterHeaters:
             print_time = toolhead.get_last_move_time()
             gcode.respond_raw(self._get_temp(eventtime))
             eventtime = reactor.pause(eventtime + 1.)
-    def set_temperature(self, heater, temp, wait=False):
+    def set_temperature(self, heater, temp, rate=0., wait=False):
         toolhead = self.printer.lookup_object('toolhead')
         toolhead.register_lookahead_callback((lambda pt: None))
-        heater.set_temp(temp)
+        heater.set_temp(temp, rate)
         if wait and temp:
             self._wait_for_temperature(heater)
     cmd_TEMPERATURE_WAIT_help = "Wait for a temperature on a sensor"
@@ -379,6 +410,25 @@ class PrinterHeaters:
             if temp >= min_temp and temp <= max_temp:
                 return
             print_time = toolhead.get_last_move_time()
+            gcmd.respond_raw(self._get_temp(eventtime))
+            eventtime = reactor.pause(eventtime + 1.)
+    cmd_TEMPERATURE_WAIT_RAMP_help = "Wait for a temperature ramp-up to complete on a sensor"
+    def cmd_TEMPERATURE_WAIT_RAMP(self, gcmd):
+        sensor_name = gcmd.get('SENSOR')
+        if sensor_name not in self.available_sensors:
+            raise gcmd.error("Unknown sensor '%s'" % (sensor_name,))
+        if sensor_name in self.heaters:
+            sensor = self.heaters[sensor_name]
+        else:
+            sensor = self.printer.lookup_object(sensor_name)
+        ramp_target = sensor.get_ramp_target()
+        if not ramp_target:
+            return
+        reactor = self.printer.get_reactor()
+        eventtime = reactor.monotonic()
+        while not self.printer.is_shutdown():
+            if not sensor.get_ramp_target():
+                return
             gcmd.respond_raw(self._get_temp(eventtime))
             eventtime = reactor.pause(eventtime + 1.)
 
