@@ -97,7 +97,7 @@ class Heater:
                 )
                 if self.target_temp == self.ramp_target:
                     self.ramp_rate = self.ramp_target = self.ramp_start_time = self.ramp_start_temp = 0.
-            self.control.temperature_update(read_time, temp, self.target_temp)
+            self.control.temperature_update(read_time, temp, self.target_temp, rate=self.ramp_rate)
             temp_diff = temp - self.smoothed_temp
             adj_time = min(time_diff * self.inv_smooth_time, 1.)
             self.smoothed_temp += temp_diff * adj_time
@@ -193,7 +193,7 @@ class ControlBangBang:
         self.heater_max_power = heater.get_max_power()
         self.max_delta = config.getfloat('max_delta', 2.0, above=0.)
         self.heating = False
-    def temperature_update(self, read_time, temp, target_temp):
+    def temperature_update(self, read_time, temp, target_temp, rate=None):
         if self.heating and temp >= target_temp+self.max_delta:
             self.heating = False
         elif not self.heating and temp <= target_temp-self.max_delta:
@@ -228,7 +228,7 @@ class ControlPID:
         self.prev_temp_time = 0.
         self.prev_temp_deriv = 0.
         self.prev_temp_integ = 0.
-    def temperature_update(self, read_time, temp, target_temp):
+    def temperature_update(self, read_time, temp, target_temp, rate=None):
         time_diff = read_time - self.prev_temp_time
         # Calculate change of temperature
         temp_diff = temp - self.prev_temp
@@ -237,6 +237,8 @@ class ControlPID:
         else:
             temp_deriv = (self.prev_temp_deriv * (self.min_deriv_time-time_diff)
                           + temp_diff) / self.min_deriv_time
+        if rate:
+            temp_deriv -= rate / 3600
         # Calculate accumulated temperature "error"
         temp_err = target_temp - temp
         temp_integ = self.prev_temp_integ + temp_err * time_diff
