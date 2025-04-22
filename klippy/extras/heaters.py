@@ -179,9 +179,13 @@ class Heater:
     def cmd_SET_HEATER_TEMPERATURE(self, gcmd):
         temp = gcmd.get_float('TARGET', 0.)
         rate = gcmd.get_float('RATE', 0.)
-        pheaters = self.printer.lookup_object('heaters')
+        hold = gcmd.get_float('HOLD', 0.)
+        if hold and not rate:
+            logging.warning("Ignoring HOLD because RATE is not provided")
+        pheaters: PrinterHeaters = self.printer.lookup_object('heaters')
         pheaters.set_temperature(self, temp, rate)
-
+        if rate:
+            pheaters.temperature_wait_ramp(self, hold=hold)
 
 ######################################################################
 # Bang-bang control algo
@@ -285,8 +289,6 @@ class PrinterHeaters:
         gcode.register_command("M105", self.cmd_M105, when_not_ready=True)
         gcode.register_command("TEMPERATURE_WAIT", self.cmd_TEMPERATURE_WAIT,
                                desc=self.cmd_TEMPERATURE_WAIT_help)
-        gcode.register_command("TEMPERATURE_WAIT_RAMP", self.cmd_TEMPERATURE_WAIT_RAMP,
-                               desc=self.cmd_TEMPERATURE_WAIT_RAMP_help)
     def load_config(self, config):
         self.have_load_sensors = True
         # Load default temperature sensors
@@ -353,7 +355,7 @@ class PrinterHeaters:
     # G-Code M105 temperature reporting
     def _handle_ready(self):
         self.has_started = True
-    def _get_temp(self, eventtime):
+    def _get_temp_msg(self, eventtime):
         # Tn:XXX /YYY B:XXX /YYY
         out = []
         if self.has_started:
@@ -366,7 +368,7 @@ class PrinterHeaters:
     def cmd_M105(self, gcmd):
         # Get Extruder Temperature
         reactor = self.printer.get_reactor()
-        msg = self._get_temp(reactor.monotonic())
+        msg = self._get_temp_msg(reactor.monotonic())
         did_ack = gcmd.ack(msg)
         if not did_ack:
             gcmd.respond_raw(msg)
@@ -380,7 +382,7 @@ class PrinterHeaters:
         eventtime = reactor.monotonic()
         while not self.printer.is_shutdown() and heater.check_busy(eventtime):
             print_time = toolhead.get_last_move_time()
-            gcode.respond_raw(self._get_temp(eventtime))
+            gcode.respond_raw(self._get_temp_msg(eventtime))
             eventtime = reactor.pause(eventtime + 1.)
     def set_temperature(self, heater, temp, rate=0., wait=False):
         toolhead = self.printer.lookup_object('toolhead')
@@ -408,31 +410,43 @@ class PrinterHeaters:
         reactor = self.printer.get_reactor()
         eventtime = reactor.monotonic()
         while not self.printer.is_shutdown():
-            temp, target = sensor.get_temp(eventtime)
+            temp, target = sensor._get_temp_msg(eventtime)
             if temp >= min_temp and temp <= max_temp:
                 return
             print_time = toolhead.get_last_move_time()
-            gcmd.respond_raw(self._get_temp(eventtime))
+            gcmd.respond_raw(self._get_temp_msg(eventtime))
             eventtime = reactor.pause(eventtime + 1.)
-    cmd_TEMPERATURE_WAIT_RAMP_help = "Wait for a temperature ramp-up to complete on a sensor"
-    def cmd_TEMPERATURE_WAIT_RAMP(self, gcmd):
-        sensor_name = gcmd.get('SENSOR')
+
+    def get_sensor(self, sensor_name: str):
+        gcode = self.printer.lookup_object("gcode")
         if sensor_name not in self.available_sensors:
-            raise gcmd.error("Unknown sensor '%s'" % (sensor_name,))
+            raise gcode.error("Unknown sensor '%s'" % (sensor_name,))
         if sensor_name in self.heaters:
-            sensor = self.heaters[sensor_name]
+            return self.heaters[sensor_name]
         else:
-            sensor = self.printer.lookup_object(sensor_name)
-        ramp_target = sensor.get_ramp_target()
-        if not ramp_target:
-            return
+            return self.printer.lookup_object(sensor_name)
+
+    def temperature_wait_ramp(self, sensor, hold=0.):
+        if isinstance(sensor, str):
+            sensor = self.get_sensor(sensor)
+
         reactor = self.printer.get_reactor()
         eventtime = reactor.monotonic()
-        while not self.printer.is_shutdown():
-            if not sensor.get_ramp_target():
-                return
-            gcmd.respond_raw(self._get_temp(eventtime))
+        gcode = self.printer.lookup_object("gcode")
+
+        # Wait for ramp target to be reached.
+        while not self.printer.is_shutdown() and sensor.get_ramp_target():
+            msg = self._get_temp_msg(eventtime)
+            gcode.respond_raw(msg)
             eventtime = reactor.pause(eventtime + 1.)
+
+        # Wait for 'hold' amount of hours.
+        hold_start = eventtime
+        while not self.printer.is_shutdown() and eventtime - hold_start <= hold * 3600:
+            msg = self._get_temp_msg(eventtime)
+            gcode.respond_raw(msg)
+            eventtime = reactor.pause(eventtime + 1.)
+
 
 def load_config(config):
     return PrinterHeaters(config)
