@@ -4,7 +4,9 @@
 #
 # This file may be distributed under the terms of the GNU GPLv3 license.
 import os, logging, threading
-
+import configparser
+import ast
+import operator
 
 ######################################################################
 # Heater
@@ -35,7 +37,20 @@ class Heater:
         is_fileoutput = (self.printer.get_start_args().get('debugoutput')
                          is not None)
         self.can_extrude = self.min_extrude_temp <= 0. or is_fileoutput
-        self.max_power = config.getfloat('max_power', 1., above=0., maxval=1.)
+
+        self._max_power = self._max_power_formula = None
+        max_power = config.get('max_power', 1.)
+        if isinstance(max_power, int) or isinstance(max_power, float):
+            if not 0 <= max_power <= 1:
+                raise configparser.Error(f"Option 'max_power' in section '{config.section}' must be between 0 and 1")
+            self.max_power = max_power
+        else:
+            self._max_power_formula = ast.parse(max_power, mode="eval")
+            try:
+                self._eval_max_power(temperature=AMBIENT_TEMP)
+            except Exception as e:
+                raise configparser.Error(f"Option 'max_power' in section '{config.section}' is not a valid formula: {e}")
+
         self.smooth_time = config.getfloat('smooth_time', 1., above=0.)
         self.inv_smooth_time = 1. / self.smooth_time
         self.verify_mainthread_time = -999.
@@ -110,8 +125,50 @@ class Heater:
         return self.name
     def get_pwm_delay(self):
         return self.pwm_delay
-    def get_max_power(self):
-        return self.max_power
+
+    def _eval_max_power(self, temperature):
+        allowed_ops = {
+            ast.Add: operator.add,
+            ast.Sub: operator.sub,
+            ast.Mult: operator.mul,
+            ast.Div: operator.truediv,
+            ast.Pow: operator.pow,
+            ast.USub: operator.neg,
+            ast.Call: None,  # For min, max (we'll handle specially)
+        }
+        allowed_funcs = {
+            "min": min,
+            "max": max,
+        }
+        variables = {"T": temperature}
+
+        def _eval(node):
+            if isinstance(node, ast.Num):  # constant
+                return node.n
+            elif isinstance(node, ast.Name):
+                return variables[node.id]
+            elif isinstance(node, ast.BinOp):
+                return allowed_ops[type(node.op)](_eval(node.left), _eval(node.right))
+            elif isinstance(node, ast.UnaryOp):
+                return allowed_ops[type(node.op)](_eval(node.operand))
+            elif isinstance(node, ast.Call):
+                if not isinstance(node.func, ast.Name) or node.func.id not in allowed_funcs:
+                    raise ValueError("Unsupported function")
+                func = allowed_funcs[node.func.id]
+                args = [_eval(arg) for arg in node.args]
+                return func(*args)
+            else:
+                raise TypeError(f"Unsupported expression: {ast.dump(node)}")
+
+        return _eval(self._max_power_formula.body)
+
+    def get_max_power(self, eventtime):
+        if self._max_power_formula:
+            temp, _ = self.get_temp(eventtime)
+            return self._eval_max_power(temp)
+        else:
+            return self._max_power
+
     def get_smooth_time(self):
         return self.smooth_time
     def set_temp(self, degrees, rate=0.):
@@ -194,7 +251,6 @@ class Heater:
 class ControlBangBang:
     def __init__(self, heater, config):
         self.heater = heater
-        self.heater_max_power = heater.get_max_power()
         self.max_delta = config.getfloat('max_delta', 2.0, above=0.)
         self.heating = False
     def temperature_update(self, read_time, temp, target_temp, rate=None):
@@ -203,7 +259,7 @@ class ControlBangBang:
         elif not self.heating and temp <= target_temp-self.max_delta:
             self.heating = True
         if self.heating:
-            self.heater.set_pwm(read_time, self.heater_max_power)
+            self.heater.set_pwm(read_time, self.heater.get_max_power(read_time))
         else:
             self.heater.set_pwm(read_time, 0.)
     def check_busy(self, eventtime, smoothed_temp, target_temp):
@@ -220,19 +276,17 @@ PID_SETTLE_SLOPE = .1
 class ControlPID:
     def __init__(self, heater, config):
         self.heater = heater
-        self.heater_max_power = heater.get_max_power()
         self.Kp = config.getfloat('pid_Kp') / PID_PARAM_BASE
         self.Ki = config.getfloat('pid_Ki') / PID_PARAM_BASE
         self.Kd = config.getfloat('pid_Kd') / PID_PARAM_BASE
         self.min_deriv_time = heater.get_smooth_time()
-        self.temp_integ_max = 0.
-        if self.Ki:
-            self.temp_integ_max = self.heater_max_power / self.Ki
         self.prev_temp = AMBIENT_TEMP
         self.prev_temp_time = 0.
         self.prev_temp_deriv = 0.
         self.prev_temp_integ = 0.
+
     def temperature_update(self, read_time, temp, target_temp, rate=None):
+        max_power = self.heater.get_max_power(read_time)
         time_diff = read_time - self.prev_temp_time
         # Calculate change of temperature
         temp_diff = temp - self.prev_temp
@@ -245,13 +299,16 @@ class ControlPID:
             temp_deriv -= rate / 3600
         # Calculate accumulated temperature "error"
         temp_err = target_temp - temp
+        temp_integ_max = 0.
+        if self.Ki:
+            temp_integ_max = max_power / self.Ki
         temp_integ = self.prev_temp_integ + temp_err * time_diff
-        temp_integ = max(0., min(self.temp_integ_max, temp_integ))
+        temp_integ = max(0., min(temp_integ_max, temp_integ))
         # Calculate output
         co = self.Kp*temp_err + self.Ki*temp_integ - self.Kd*temp_deriv
         #logging.debug("pid: %f@%.3f -> diff=%f deriv=%f err=%f integ=%f co=%d",
         #    temp, read_time, temp_diff, temp_deriv, temp_err, temp_integ, co)
-        bounded_co = max(0., min(self.heater_max_power, co))
+        bounded_co = max(0., min(max_power, co))
         self.heater.set_pwm(read_time, bounded_co)
         # Store state for next measurement
         self.prev_temp = temp
