@@ -78,10 +78,6 @@ class Heater:
         # Load additional modules
         self.printer.load_object(config, "verify_heater %s" % (short_name,))
         self.printer.load_object(config, "pid_calibrate")
-        gcode = self.printer.lookup_object("gcode")
-        gcode.register_mux_command("SET_HEATER_TEMPERATURE", "HEATER",
-                                   short_name, self.cmd_SET_HEATER_TEMPERATURE,
-                                   desc=self.cmd_SET_HEATER_TEMPERATURE_help)
         self.printer.register_event_handler("klippy:shutdown",
                                             self._handle_shutdown)
     def set_pwm(self, read_time, value):
@@ -232,17 +228,7 @@ class Heater:
             last_pwm_value = self.last_pwm_value
         return {'temperature': round(smoothed_temp, 2), 'target': target_temp,
                 'power': last_pwm_value}
-    cmd_SET_HEATER_TEMPERATURE_help = "Sets a heater temperature"
-    def cmd_SET_HEATER_TEMPERATURE(self, gcmd):
-        temp = gcmd.get_float('TARGET', 0.)
-        rate = gcmd.get_float('RATE', 0.)
-        hold = gcmd.get_float('HOLD', 0.)
-        if hold and not rate:
-            logging.warning("Ignoring HOLD because RATE is not provided")
-        pheaters: PrinterHeaters = self.printer.lookup_object('heaters')
-        pheaters.set_temperature(self, temp, rate)
-        if rate:
-            pheaters.temperature_wait_ramp(self, hold=hold)
+
 
 ######################################################################
 # Bang-bang control algo
@@ -341,11 +327,14 @@ class PrinterHeaters:
                                             self.turn_off_all_heaters)
         # Register commands
         gcode = self.printer.lookup_object('gcode')
+        gcode.register_command("SET_HEATER_TEMPERATURE", self.cmd_SET_HEATER_TEMPERATURE,
+                                   desc="Sets a heater temperature")
         gcode.register_command("TURN_OFF_HEATERS", self.cmd_TURN_OFF_HEATERS,
-                               desc=self.cmd_TURN_OFF_HEATERS_help)
+                               desc="Turn off all heaters")
         gcode.register_command("M105", self.cmd_M105, when_not_ready=True)
         gcode.register_command("TEMPERATURE_WAIT", self.cmd_TEMPERATURE_WAIT,
-                               desc=self.cmd_TEMPERATURE_WAIT_help)
+                               desc="Wait for a temperature on a sensor")
+
     def load_config(self, config):
         self.have_load_sensors = True
         # Load default temperature sensors
@@ -359,8 +348,10 @@ class PrinterHeaters:
             raise config.error("Cannot load config '%s'" % (filename,))
         for c in dconfig.get_prefix_sections(''):
             self.printer.load_object(dconfig, c.get_name())
+
     def add_sensor_factory(self, sensor_type, sensor_factory):
         self.sensor_factories[sensor_type] = sensor_factory
+
     def setup_heater(self, config, gcode_id=None):
         heater_name = config.get_name().split()[-1]
         if heater_name in self.heaters:
@@ -372,13 +363,16 @@ class PrinterHeaters:
         self.register_sensor(config, heater, gcode_id)
         self.available_heaters.append(config.get_name())
         return heater
+
     def get_all_heaters(self):
         return self.available_heaters
+
     def lookup_heater(self, heater_name):
         if heater_name not in self.heaters:
             raise self.printer.config_error(
                 "Unknown heater '%s'" % (heater_name,))
         return self.heaters[heater_name]
+
     def setup_sensor(self, config):
         if not self.have_load_sensors:
             self.load_config(config)
@@ -387,6 +381,7 @@ class PrinterHeaters:
             raise self.printer.config_error(
                 "Unknown temperature sensor '%s'" % (sensor_type,))
         return self.sensor_factories[sensor_type](config)
+
     def register_sensor(self, config, psensor, gcode_id=None):
         self.available_sensors.append(config.get_name())
         if gcode_id is None:
@@ -397,21 +392,26 @@ class PrinterHeaters:
             raise self.printer.config_error(
                 "G-Code sensor id %s already registered" % (gcode_id,))
         self.gcode_id_to_sensor[gcode_id] = psensor
+
     def register_monitor(self, config):
         self.available_monitors.append(config.get_name())
+
     def get_status(self, eventtime):
         return {'available_heaters': self.available_heaters,
                 'available_sensors': self.available_sensors,
                 'available_monitors': self.available_monitors}
+
     def turn_off_all_heaters(self, print_time=0.):
         for heater in self.heaters.values():
             heater.set_temp(0.)
-    cmd_TURN_OFF_HEATERS_help = "Turn off all heaters"
+
     def cmd_TURN_OFF_HEATERS(self, gcmd):
         self.turn_off_all_heaters()
-    # G-Code M105 temperature reporting
+
     def _handle_ready(self):
+        # G-Code M105 temperature reporting
         self.has_started = True
+
     def _get_temp_msg(self, eventtime):
         # Tn:XXX /YYY B:XXX /YYY
         out = []
@@ -422,6 +422,7 @@ class PrinterHeaters:
         if not out:
             return "T:0"
         return " ".join(out)
+
     def cmd_M105(self, gcmd):
         # Get Extruder Temperature
         reactor = self.printer.get_reactor()
@@ -429,6 +430,7 @@ class PrinterHeaters:
         did_ack = gcmd.ack(msg)
         if not did_ack:
             gcmd.respond_raw(msg)
+
     def _wait_for_temperature(self, heater):
         # Helper to wait on heater.check_busy() and report M105 temperatures
         if self.printer.get_start_args().get('debugoutput') is not None:
@@ -441,13 +443,32 @@ class PrinterHeaters:
             print_time = toolhead.get_last_move_time()
             gcode.respond_raw(self._get_temp_msg(eventtime))
             eventtime = reactor.pause(eventtime + 1.)
+
     def set_temperature(self, heater, temp, rate=0., wait=False):
         toolhead = self.printer.lookup_object('toolhead')
         toolhead.register_lookahead_callback((lambda pt: None))
         heater.set_temp(temp, rate)
         if wait and temp:
             self._wait_for_temperature(heater)
-    cmd_TEMPERATURE_WAIT_help = "Wait for a temperature on a sensor"
+
+    def cmd_SET_HEATER_TEMPERATURE(self, gcmd):
+        heater_name = gcmd.get('HEATER', '')
+        heater = None
+        if heater_name:
+            heater = self.get_heater(heater_name)
+            if heater is None:
+                raise gcmd.error(f"Error on 'SET_HEATER_TEMPERATURE': unknown heater '{heater_name}'")
+        else:
+            heater = self.get_default_heater()
+        temp = gcmd.get_float('TARGET', 0.)
+        rate = gcmd.get_float('RATE', 0.)
+        hold = gcmd.get_float('HOLD', 0.)
+        if hold and not rate:
+            logging.warning('Ignoring HOLD because RATE is not provided')
+        self.set_temperature(heater, temp, rate)
+        if rate:
+            self.temperature_wait_ramp(heater, hold=hold)
+
     def cmd_TEMPERATURE_WAIT(self, gcmd):
         sensor_name = gcmd.get('SENSOR')
         if sensor_name not in self.available_sensors:
@@ -474,18 +495,28 @@ class PrinterHeaters:
             gcmd.respond_raw(self._get_temp_msg(eventtime))
             eventtime = reactor.pause(eventtime + 1.)
 
-    def get_sensor(self, sensor_name: str):
-        gcode = self.printer.lookup_object("gcode")
-        if sensor_name not in self.available_sensors:
-            raise gcode.error("Unknown sensor '%s'" % (sensor_name,))
-        if sensor_name in self.heaters:
-            return self.heaters[sensor_name]
+    def get_heater(self, heater_name: str):
+        if heater_name not in self.available_sensors:
+            return None
+        if heater_name in self.heaters:
+            return self.heaters[heater_name]
         else:
-            return self.printer.lookup_object(sensor_name)
+            return self.printer.lookup_object(heater_name)
+
+    def get_default_heater(self):
+        return None
+        # TODO:
+        # - bed
+        # - only one heater defined -> return this heater
+        # - raise error / return None
 
     def temperature_wait_ramp(self, sensor, hold=0.):
+        err_msg = f"Unknown sensor '{sensor}'"
         if isinstance(sensor, str):
-            sensor = self.get_sensor(sensor)
+            sensor = self.get_heater(sensor)
+        if sensor is None:
+            gcode = self.printer.lookup_object("gcode")
+            raise gcode.error(err_msg)
 
         reactor = self.printer.get_reactor()
         eventtime = reactor.monotonic()
