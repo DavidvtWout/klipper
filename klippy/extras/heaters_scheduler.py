@@ -1,5 +1,5 @@
-from typing import TYPE_CHECKING
 from threading import Lock
+from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from ..configfile import ConfigWrapper
@@ -28,7 +28,7 @@ class HeatersScheduler:
     def __init__(self, config: 'ConfigWrapper'):
         self.printer: 'Printer' = config.get_printer()
         self.reactor: 'Reactor' = self.printer.get_reactor()
-        self._heater_names: list[str] = config.getlist("heaters")
+        self._heater_names: list[str] = config.getlist("heaters", [])
         self.heaters: list['Heater'] = []
         self.update_interval = config.getfloat("update_interval", 1.0)
 
@@ -59,6 +59,16 @@ class HeatersScheduler:
         self.heaters = [pheaters.lookup_heater(heater_name) for heater_name in self._heater_names]
         self.reactor.update_timer(self.timer, self.reactor.NOW)
 
+    def lowest_temperature(self) -> float:
+        if self.heaters:
+            return min(h.last_temp for h in self.heaters)
+        return 0.
+
+    def highest_temperature(self) -> float:
+        if self.heaters:
+            return max(h.last_temp for h in self.heaters)
+        return float("inf")
+
     def _update_targets(self, eventtime):
         if self.paused:
             with self.lock:
@@ -70,19 +80,30 @@ class HeatersScheduler:
         with self.lock:
             if not self.schedule:
                 return eventtime + self.update_interval
-
             step = self.schedule[0]
+            while True:
+                # Skip steps that already have completed. This makes restarts of full schedules mid-fire easier.
+                if (step.rate > 0 and step.target_temperature < self.lowest_temperature()) or (
+                        step.rate < 0 and step.target_temperature > self.highest_temperature()):
+                    self.schedule.pop(0)
+                else:
+                    break
+                if not self.schedule:
+                    return eventtime + self.update_interval
+                step = self.schedule[0]
+
             if not step.start_time:
                 step.start_time = eventtime
                 step.end_time = step.start_time + step.duration
 
             current_target = step.start_temperature + (step.rate / 3600) * (eventtime - step.start_time)
-            if step.rate < 0:
-                current_target = max(current_target, step.target_temperature)
-            else:
+            if step.rate > 0:
                 current_target = min(current_target, step.target_temperature)
+            else:
+                current_target = max(current_target, step.target_temperature)
 
             if eventtime >= step.end_time:
+                # TODO: print something to commandline
                 self.schedule.pop(0)
 
         for heater in self.heaters:
@@ -111,26 +132,26 @@ class HeatersScheduler:
         with self.lock:
             for i, step in enumerate(self.schedule):
                 seconds += step.duration
-                minutes += seconds // 60
+                minutes += int(seconds // 60)
                 seconds %= 60
-                hours += minutes // 60
+                hours += int(minutes // 60)
                 minutes %= 60
 
                 lines.append(
-                    f"|{str(i).ljust(5)} "
-                    f"|{str(round(step.rate)).ljust(4)} °C/h "
-                    f"|{str(round(step.target_temperature)).ljust(5)} °C "
-                    f"|{str(step.hold).ljust(4) + ' min ' if step.hold else '       - '}"
-                    f"|{str(hours).ljust(3)}:{str(minutes).zfill(2)} |")
+                    f"|{str(i).rjust(5)} "
+                    f"|{str(round(step.rate)).rjust(4)} °C/h "
+                    f"|{str(round(step.target_temperature)).rjust(5)} °C "
+                    f"|{str(step.hold).rjust(4) + ' min ' if step.hold else '       - '}"
+                    f"|{str(hours).rjust(3)}:{str(minutes).zfill(2)} |")
 
-        msg = "".join(lines)
+        msg = "\n".join(lines)
         did_ack = gcmd.ack(msg)
         if not did_ack:
             gcmd.respond_raw(msg)
 
     def cmd_HEATING_SCHEDULE_ADD_STEP(self, gcmd: 'GCodeCommand'):
-        target = gcmd.get("TARGET")
-        rate = gcmd.get("RATE")
+        target = gcmd.get_float("TARGET")
+        rate = gcmd.get_float("RATE")
         start_temp = gcmd.get_float("FROM", default=0.)
         hold = gcmd.get_float("HOLD", default=0.)
         # TODO: convert to bool
@@ -138,22 +159,19 @@ class HeatersScheduler:
         start = gcmd.get("START", default=False)
         self.add_heating_schedule_step(target, rate, start_temp, hold, clear, start)
 
-    def add_heating_schedule_step(self, target: float, rate: float, start_temp: float = None, hold: float = 0., clear: bool = False, start: bool = True):
-        if not start_temp:
-            with self.lock:
-                if self.schedule:
-                    start_temp = self.schedule[-1].target_temperature
-            if not start_temp:
-                # TODO: determine start_temp based on lowest current temperature of heaters
-                start_temp = 10.
-
+    def add_heating_schedule_step(self, target: float, rate: float, start_temp: float = None, hold: float = 0.,
+                                  clear: bool = False, start: bool = True):
         step = ScheduleStep(start_temperature=start_temp, target_temperature=target, rate=rate, hold=hold)
-
         with self.lock:
             if clear:
                 self.schedule = [step]
             else:
                 self.schedule.append(step)
+            if start_temp is None:
+                if len(self.schedule) >= 2:
+                    step.start_temp = self.schedule[-2].target_temperature
+                else:
+                    step.start_temp = self.lowest_temperature()
 
         if start:
             self.paused = False
@@ -164,13 +182,10 @@ class HeatersScheduler:
 
         pheaters = self.printer.lookup_object('heaters')
         heater = pheaters.lookup_heater(heater_name)
-        self.override_heater(heater, pwm_value)
-
-    def override_heater(self, heater: 'Heater', pwm_value: float):
-        eventtime = self.reactor.monotonic()
-        self.pause()
-        heater.set_pwm(eventtime, pwm_value, override=True)
+        heater.override_pwm_value(pwm_value)
 
 
 def load_config(config):
-    return HeatersScheduler(config)
+    scheduler = HeatersScheduler(config)
+    config.get_printer().add_object('heaters_scheduler', scheduler)
+    return scheduler
