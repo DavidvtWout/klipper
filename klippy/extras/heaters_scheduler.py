@@ -141,7 +141,7 @@ class HeatersScheduler:
                     f"|{str(i).rjust(5)} "
                     f"|{str(round(step.rate)).rjust(4)} °C/h "
                     f"|{str(round(step.target_temperature)).rjust(5)} °C "
-                    f"|{str(step.hold).rjust(4) + ' min ' if step.hold else '       - '}"
+                    f"|{str(int(step.hold)).rjust(4) + ' min ' if step.hold else '       - '}"
                     f"|{str(hours).rjust(3)}:{str(minutes).zfill(2)} |")
 
         msg = "\n".join(lines)
@@ -167,11 +167,11 @@ class HeatersScheduler:
                 self.schedule = [step]
             else:
                 self.schedule.append(step)
-            if start_temp is None:
+            if not start_temp:
                 if len(self.schedule) >= 2:
-                    step.start_temp = self.schedule[-2].target_temperature
+                    step.start_temperature = self.schedule[-2].target_temperature
                 else:
-                    step.start_temp = self.lowest_temperature()
+                    step.start_temperature = self.lowest_temperature()
 
         if start:
             self.paused = False
