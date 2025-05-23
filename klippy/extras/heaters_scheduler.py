@@ -10,18 +10,10 @@ if TYPE_CHECKING:
 
 
 class ScheduleStep:
-    def __init__(self, start_temperature: float, target_temperature: float, rate: float, hold: float):
-        self.start_temperature = start_temperature
+    def __init__(self, target_temperature: float, rate: float, hold: float):
         self.target_temperature = target_temperature
         self.rate = rate
         self.hold = hold
-
-        delta_temp = self.target_temperature - self.start_temperature
-        ramp_time = delta_temp / self.rate * 3600
-        self.duration = ramp_time + self.hold * 60
-
-        self.start_time = None
-        self.end_time = None
 
 
 class HeatersScheduler:
@@ -32,8 +24,10 @@ class HeatersScheduler:
         self.heaters: list['Heater'] = []
         self.update_interval = config.getfloat("update_interval", 1.0)
 
-        self.schedule: list[ScheduleStep] = []
-        self.step_start_time = 0.
+        self._schedule: list['ScheduleStep'] = []
+        self._current_step: 'ScheduleStep' = None
+        self._step_start_time = 0.
+        self._step_start_temperature = 0.
         self.paused = True
         self.lock = Lock()
         self.timer = self.reactor.register_timer(self._update_targets)
@@ -69,42 +63,54 @@ class HeatersScheduler:
             return max(h.last_temp for h in self.heaters)
         return float("inf")
 
+    def _next_step(self, eventtime: float):
+        previous_step = self._current_step
+        self._current_step = self._schedule.pop(0)
+        self._step_start_time = eventtime
+        if previous_step:
+            self._step_start_temperature = previous_step.target_temperature
+        else:
+            if self._current_step.rate > 0:
+                self._step_start_temperature = self.lowest_temperature()
+            else:
+                self._step_start_temperature = self.highest_temperature()
+
     def _update_targets(self, eventtime):
         if self.paused:
-            with self.lock:
-                if self.schedule and self.schedule[0].start_time:
-                    self.schedule[0].start_time += self.update_interval
-                    self.schedule[0].end_time += self.update_interval
+            self._step_start_time += self.update_interval
             return eventtime + self.update_interval
 
         with self.lock:
-            if not self.schedule:
-                return eventtime + self.update_interval
-            step = self.schedule[0]
+            if not self._current_step:
+                if self._schedule:
+                    self._next_step(eventtime)
+                else:
+                    return eventtime + self.update_interval
+
             while True:
+                rate = self._current_step.rate
+                target = self._current_step.target_temperature
                 # Skip steps that already have completed. This makes restarts of full schedules mid-fire easier.
-                if (step.rate > 0 and step.target_temperature < self.lowest_temperature()) or (
-                        step.rate < 0 and step.target_temperature > self.highest_temperature()):
-                    self.schedule.pop(0)
+                if (rate > 0 and target < self.lowest_temperature()) or (rate < 0 and target > self.highest_temperature()):
+                    self._current_step = None
+                    if not self._schedule:
+                        return eventtime + self.update_interval
+                    self._next_step(eventtime)
                 else:
                     break
-                if not self.schedule:
-                    return eventtime + self.update_interval
-                step = self.schedule[0]
 
-            if not step.start_time:
-                step.start_time = eventtime
-                step.end_time = step.start_time + step.duration
-
-            current_target = step.start_temperature + (step.rate / 3600) * (eventtime - step.start_time)
-            if step.rate > 0:
-                current_target = min(current_target, step.target_temperature)
+            rate = self._current_step.rate
+            current_target = self._step_start_temperature + (rate / 3600) * (eventtime - self._step_start_time)
+            if rate > 0:
+                current_target = min(current_target, self._current_step.target_temperature)
             else:
-                current_target = max(current_target, step.target_temperature)
+                current_target = max(current_target, self._current_step.target_temperature)
 
-            if eventtime >= step.end_time:
+            temp_delta = self._current_step.target_temperature - self._step_start_temperature
+            end_time = self._step_start_time + temp_delta / (rate / 3600) + self._current_step.hold * 60
+            if eventtime >= end_time:
                 # TODO: print something to commandline
-                self.schedule.pop(0)
+                self._next_step(eventtime)
 
         for heater in self.heaters:
             heater.set_temp(current_target)
@@ -112,7 +118,7 @@ class HeatersScheduler:
 
     def flush_schedule(self):
         with self.lock:
-            self.schedule = []
+            self._schedule = []
 
     def pause(self):
         self.paused = True
@@ -130,8 +136,11 @@ class HeatersScheduler:
         lines = ["| step |     rate |  target |    hold |  time |"]
         hours = minutes = seconds = 0
         with self.lock:
-            for i, step in enumerate(self.schedule):
-                seconds += step.duration
+            previous_target = self.lowest_temperature()
+            for i, step in enumerate(self._schedule):
+                temp_delta = step.target_temperature - previous_target
+                seconds += temp_delta / (step.rate / 3600) + step.hold * 60
+                previous_target = step.target_temperature
                 minutes += int(seconds // 60)
                 seconds %= 60
                 hours += int(minutes // 60)
@@ -152,26 +161,22 @@ class HeatersScheduler:
     def cmd_HEATING_SCHEDULE_ADD_STEP(self, gcmd: 'GCodeCommand'):
         target = gcmd.get_float("TARGET")
         rate = gcmd.get_float("RATE")
-        start_temp = gcmd.get_float("FROM", default=0.)
+        if rate == 0.:
+            raise gcmd.error("RATE must be non-zero")
         hold = gcmd.get_float("HOLD", default=0.)
         # TODO: convert to bool
         clear = gcmd.get("CLEAR", default=False)
         start = gcmd.get("START", default=False)
-        self.add_heating_schedule_step(target, rate, start_temp, hold, clear, start)
+        self.add_heating_schedule_step(target, rate, hold, clear, start)
 
-    def add_heating_schedule_step(self, target: float, rate: float, start_temp: float = None, hold: float = 0.,
+    def add_heating_schedule_step(self, target: float, rate: float, hold: float = 0.,
                                   clear: bool = False, start: bool = True):
-        step = ScheduleStep(start_temperature=start_temp, target_temperature=target, rate=rate, hold=hold)
+        step = ScheduleStep(target_temperature=target, rate=rate, hold=hold)
         with self.lock:
             if clear:
-                self.schedule = [step]
-            else:
-                self.schedule.append(step)
-            if not start_temp:
-                if len(self.schedule) >= 2:
-                    step.start_temperature = self.schedule[-2].target_temperature
-                else:
-                    step.start_temperature = self.lowest_temperature()
+                self._previous_step = None
+                self._schedule = []
+            self._schedule.append(step)
 
         if start:
             self.paused = False
