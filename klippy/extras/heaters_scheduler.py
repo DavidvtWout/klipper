@@ -1,3 +1,4 @@
+import time
 from threading import Lock
 from typing import TYPE_CHECKING
 
@@ -84,20 +85,20 @@ class HeatersScheduler:
             if not self._current_step:
                 if self._schedule:
                     self._next_step(eventtime)
+                    while True:
+                        rate = self._current_step.rate
+                        target = self._current_step.target_temperature
+                        # Skip steps that already have completed. This makes restarts of full schedules mid-fire easier.
+                        if (rate > 0 and target < self.lowest_temperature()) or (
+                                rate < 0 and target > self.highest_temperature()):
+                            self._current_step = None
+                            if not self._schedule:
+                                return eventtime + self.update_interval
+                            self._next_step(eventtime)
+                        else:
+                            break
                 else:
                     return eventtime + self.update_interval
-
-            while True:
-                rate = self._current_step.rate
-                target = self._current_step.target_temperature
-                # Skip steps that already have completed. This makes restarts of full schedules mid-fire easier.
-                if (rate > 0 and target < self.lowest_temperature()) or (rate < 0 and target > self.highest_temperature()):
-                    self._current_step = None
-                    if not self._schedule:
-                        return eventtime + self.update_interval
-                    self._next_step(eventtime)
-                else:
-                    break
 
             rate = self._current_step.rate
             current_target = self._step_start_temperature + (rate / 3600) * (eventtime - self._step_start_time)
@@ -114,7 +115,7 @@ class HeatersScheduler:
 
         for heater in self.heaters:
             heater.set_temp(current_target)
-        return eventtime + self.update_interval
+        return min(eventtime + self.update_interval, end_time)
 
     def flush_schedule(self):
         with self.lock:
@@ -133,11 +134,14 @@ class HeatersScheduler:
         self.resume()
 
     def cmd_HEATING_SCHEDULE_SHOW(self, gcmd: 'GCodeCommand'):
-        lines = ["| step |     rate |  target |    hold |  time |"]
+        lines = ["| step |      rate |  target |    hold |  time |"]
         hours = minutes = seconds = 0
+        time.sleep(0.1)
         with self.lock:
             previous_target = self.lowest_temperature()
-            for i, step in enumerate(self._schedule):
+            step = self._current_step
+            i = 0
+            while step:
                 temp_delta = step.target_temperature - previous_target
                 seconds += temp_delta / (step.rate / 3600) + step.hold * 60
                 previous_target = step.target_temperature
@@ -148,10 +152,16 @@ class HeatersScheduler:
 
                 lines.append(
                     f"|{str(i).rjust(5)} "
-                    f"|{str(round(step.rate)).rjust(4)} °C/h "
+                    f"|{str(round(step.rate)).rjust(5)} °C/h "
                     f"|{str(round(step.target_temperature)).rjust(5)} °C "
                     f"|{str(int(step.hold)).rjust(4) + ' min ' if step.hold else '       - '}"
                     f"|{str(hours).rjust(3)}:{str(minutes).zfill(2)} |")
+
+                try:
+                    step = self._schedule[i]
+                    i += 1
+                except IndexError:
+                    step = None
 
         msg = "\n".join(lines)
         did_ack = gcmd.ack(msg)
@@ -174,7 +184,7 @@ class HeatersScheduler:
         step = ScheduleStep(target_temperature=target, rate=rate, hold=hold)
         with self.lock:
             if clear:
-                self._previous_step = None
+                self._current_step = None
                 self._schedule = []
             self._schedule.append(step)
 
