@@ -238,15 +238,20 @@ class ControlPID:
         self.prev_temp_time = 0.
         self.prev_temp_deriv = 0.
         self.prev_temp_integ = 0.
+        self._rate = 0.
+
+    def set_rate(self, rate):
+        self._rate = rate / 3600
+
     def temperature_update(self, read_time, temp, target_temp):
         time_diff = read_time - self.prev_temp_time
         # Calculate change of temperature
         temp_diff = temp - self.prev_temp
         if time_diff >= self.min_deriv_time:
-            temp_deriv = temp_diff / time_diff
+            temp_deriv = temp_diff / time_diff - self._rate
         else:
-            temp_deriv = (self.prev_temp_deriv * (self.min_deriv_time-time_diff)
-                          + temp_diff) / self.min_deriv_time
+            temp_deriv = ((self.prev_temp_deriv * (self.min_deriv_time - time_diff)  + temp_diff) /
+                          self.min_deriv_time - self._rate)
         # Calculate accumulated temperature "error"
         temp_err = target_temp - temp
         temp_integ = self.prev_temp_integ + temp_err * time_diff
@@ -263,6 +268,7 @@ class ControlPID:
         self.prev_temp_deriv = temp_deriv
         if co == bounded_co:
             self.prev_temp_integ = temp_integ
+
     def check_busy(self, eventtime, smoothed_temp, target_temp):
         temp_diff = target_temp - smoothed_temp
         return (abs(temp_diff) > PID_SETTLE_DELTA
