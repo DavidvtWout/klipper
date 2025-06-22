@@ -32,6 +32,7 @@ class HeatersScheduler:
         self.paused = True
         self.lock = Lock()
         self.timer = self.reactor.register_timer(self._update_targets)
+        self._holding = True
 
         # Register commands
         gcode = self.printer.lookup_object('gcode')
@@ -68,6 +69,7 @@ class HeatersScheduler:
         previous_step = self._current_step
         self._current_step = self._schedule.pop(0)
         self._step_start_time = eventtime
+        self._holding = False
         if previous_step:
             self._step_start_temperature = previous_step.target_temperature
         else:
@@ -75,6 +77,8 @@ class HeatersScheduler:
                 self._step_start_temperature = self.lowest_temperature()
             else:
                 self._step_start_temperature = self.highest_temperature()
+        for heater in self.heaters:
+            heater.control.set_rate(self._current_step.rate)
 
     def _update_targets(self, eventtime):
         if self.paused:
@@ -106,6 +110,10 @@ class HeatersScheduler:
                 current_target = min(current_target, self._current_step.target_temperature)
             else:
                 current_target = max(current_target, self._current_step.target_temperature)
+            if current_target == self._current_step.target_temperature and not self._holding:
+                self._holding = True
+                for heater in self.heaters:
+                    heater.control.set_rate(0.)
 
             temp_delta = self._current_step.target_temperature - self._step_start_temperature
             end_time = self._step_start_time + temp_delta / (rate / 3600) + self._current_step.hold * 60
