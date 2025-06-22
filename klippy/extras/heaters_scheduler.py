@@ -44,8 +44,6 @@ class HeatersScheduler:
                                desc="Pause the heating schedule")
         gcode.register_command("HEATING_SCHEDULE_ADD_STEP", self.cmd_HEATING_SCHEDULE_ADD_STEP,
                                desc="Add step to the heating schedule")
-        gcode.register_command("HEATER_OVERRIDE", self.cmd_HEATER_OVERRIDE,
-                               desc="Override the PWM value for a heater")
 
         self.printer.register_event_handler("klippy:connect", self._handle_connect)
         self.printer.register_event_handler("gcode:request_restart", self.flush_schedule)
@@ -122,7 +120,8 @@ class HeatersScheduler:
                 self._next_step(eventtime)
 
         for heater in self.heaters:
-            heater.set_temp(current_target)
+            if not heater.is_overridden():
+                heater.set_temp(current_target)
         return min(eventtime + self.update_interval, end_time)
 
     def flush_schedule(self):
@@ -198,14 +197,6 @@ class HeatersScheduler:
 
         if start:
             self.paused = False
-
-    def cmd_HEATER_OVERRIDE(self, gcmd: 'GCodeCommand'):
-        heater_name = gcmd.get('HEATER')
-        pwm_value = gcmd.get_float('PWM')
-
-        pheaters = self.printer.lookup_object('heaters')
-        heater = pheaters.lookup_heater(heater_name)
-        heater.override_pwm_value(pwm_value)
 
 
 def load_config(config):

@@ -7,9 +7,13 @@ import logging
 import os
 import threading
 from typing import TYPE_CHECKING
+import configparser
 
 if TYPE_CHECKING:
     from heaters_scheduler import HeatersScheduler
+    from ..gcode import GCodeCommand
+    from ..klippy import Printer
+    from ..reactor import Reactor
 
 
 ######################################################################
@@ -25,9 +29,13 @@ QUELL_STALE_TIME = 7.0
 
 class Heater:
     def __init__(self, config, sensor):
-        self.printer = config.get_printer()
+        self.printer: 'Printer' = config.get_printer()
+        self.reactor: 'Reactor' = self.printer.get_reactor()
         self.name = config.get_name()
-        self.short_name = short_name = self.name.split()[-1]
+        self.short_name = self.name.split()[-1]
+
+        self.pwm_cycle_time = config.getfloat('pwm_cycle_time', 0.100, above=0., maxval=MAX_HEAT_TIME)
+        self.max_power = config.getfloat('max_power', 1., above=0., maxval=1.)
 
         # Setup sensor
         self.sensor = sensor
@@ -36,6 +44,11 @@ class Heater:
         self.sensor.setup_minmax(self.min_temp, self.max_temp)
         self.sensor.setup_callback(self.temperature_callback)
         self.pwm_delay = self.sensor.get_report_time_delta()
+        self._pwm_off_measure = config.getboolean('pwm_off_measure', default=False)
+        if (self._pwm_off_measure and
+                self.pwm_cycle_time * (1 - self.max_power) < self.sensor.get_report_time_delta() * 4):
+            raise configparser.Error('If pwm_off_measure is enabled, the max_power must be reduced '
+                                     'to allow enough time to measure sensors while heating elements are off.')
 
         # Setup temperature checks
         self.min_extrude_temp = config.getfloat(
@@ -44,7 +57,6 @@ class Heater:
         is_fileoutput = (self.printer.get_start_args().get('debugoutput')
                          is not None)
         self.can_extrude = self.min_extrude_temp <= 0. or is_fileoutput
-        self.max_power = config.getfloat('max_power', 1., above=0., maxval=1.)
         self.smooth_time = config.getfloat('smooth_time', 1., above=0.)
         self.inv_smooth_time = 1. / self.smooth_time
         self.verify_mainthread_time = -999.
@@ -53,74 +65,81 @@ class Heater:
         self._temperature_readings = dict()
         self.last_temp_time = 0.
         # pwm caching
-        self.next_pwm_time = 0.
+        self.last_pwm_time = 0.
         self.last_pwm_value = 0.
+        self.next_pwm_time = 0.
+        self.next_pwm_value = 0.
 
         # Setup control algorithm sub-class
         algos = {'watermark': ControlBangBang, 'pid': ControlPID}
         algo = config.getchoice('control', algos)
         self.control = algo(self, config)
-        self._last_control_time = 0.
-        self._override_pwm = False
+        self._pwm_override_value = -1.
 
         # Setup output heater pin
         heater_pin = config.get('heater_pin')
         ppins = self.printer.lookup_object('pins')
         self.mcu_pwm = ppins.setup_pin('pwm', heater_pin)
-        self.pwm_cycle_time = config.getfloat('pwm_cycle_time', 0.100, above=0., maxval=MAX_HEAT_TIME)
         self.mcu_pwm.setup_cycle_time(self.pwm_cycle_time)
         self.mcu_pwm.setup_max_duration(MAX_HEAT_TIME)
+        self._pwm_timer = self.reactor.register_timer(self._pwm_timer_callback)
+        # self.reactor.update_timer(self._pwm_timer, self.pwm_cycle_time)
 
         # Load additional modules
-        self.printer.load_object(config, "verify_heater %s" % (short_name,))
-        self.printer.load_object(config, "pid_calibrate")
-        gcode = self.printer.lookup_object("gcode")
-        gcode.register_mux_command("SET_HEATER_TEMPERATURE", "HEATER",
-                                   short_name, self.cmd_SET_HEATER_TEMPERATURE,
-                                   desc=self.cmd_SET_HEATER_TEMPERATURE_help)
+        self.printer.load_object(config, f'verify_heater {self.short_name}')
+        self.printer.load_object(config, 'pid_calibrate')
+
+        # Register commands
+        gcode = self.printer.lookup_object('gcode')
+        gcode.register_mux_command(
+            'SET_HEATER_TEMPERATURE', 'HEATER', self.short_name,
+            self.cmd_SET_HEATER_TEMPERATURE, desc='Sets a heater temperature'
+        )
+        gcode.register_mux_command(
+            'HEATER_OVERRIDE', 'HEATER', self.short_name,
+            self.cmd_HEATER_OVERRIDE, desc='Override the PWM value for a heater')
+        gcode.register_mux_command(
+            'HEATER_OVERRIDE_RELEASE', 'HEATER', self.short_name,
+            self.cmd_HEATER_OVERRIDE_RELEASE, desc='Release PWM override for a heater')
+
+        self.printer.register_event_handler("klippy:connect", self._handle_connect)
         self.printer.register_event_handler("klippy:shutdown", self._handle_shutdown)
+
+    def _handle_connect(self):
+        logging.info(f'Heater {self.name} connected!')
+        self.reactor.update_timer(self._pwm_timer, self.reactor.NOW)
 
     def override_pwm_value(self, value):
         with self.lock:
-            self._override_pwm = True
             self.target_temp = 0.
-            self.last_pwm_value = value
+            self._pwm_override_value = value
 
-    def set_pwm(self, read_time, value):
-        if self.target_temp <= 0. or read_time > self.verify_mainthread_time:
-            value = 0.
-        if read_time < self.next_pwm_time and (abs(value - self.last_pwm_value) < 0.05 or self._override_pwm):
-            # No significant change in value - can suppress update
-            return
+    def _pwm_timer_callback(self, eventtime: float):
+        print_time = self.mcu_pwm.get_mcu().estimated_print_time(eventtime)
+        with self.lock:
+            self.last_pwm_time = self.next_pwm_time
+            self.last_pwm_value = self.next_pwm_value
+            self.next_pwm_time = print_time + self.pwm_delay + 0.1
+            self.next_pwm_value = self.control.temperature_update(print_time, self.smoothed_temp, self.target_temp)
+            if self.is_overridden():
+                self.next_pwm_value = self._pwm_override_value
+            if print_time > self.verify_mainthread_time:
+                self.next_pwm_value = 0.
+            self.mcu_pwm.set_pwm(self.next_pwm_time, self.next_pwm_value)
 
-        pwm_time = read_time + self.pwm_delay
-        self.next_pwm_time = pwm_time + self.pwm_cycle_time
-
-        if self._override_pwm:
-            self.mcu_pwm.set_pwm(pwm_time, self.last_pwm_value)
-        else:
-            self.last_pwm_value = value
-            self.mcu_pwm.set_pwm(pwm_time, value)
+        return eventtime + self.pwm_cycle_time
 
     def temperature_callback(self, read_time, temp):
         with self.lock:
-            self._temperature_readings[read_time] = temp
-            max_t = temp
-            for time in list(self._temperature_readings.keys()):
-                if time < read_time - self.pwm_cycle_time:
-                    del self._temperature_readings[time]
-                    continue
-                max_t = max(max_t, self._temperature_readings[time])
+            report_time = self.sensor.get_report_time_delta()
+            if self.last_pwm_time - report_time < read_time < self.last_pwm_time + self.pwm_cycle_time * self.last_pwm_value + 2 * report_time:
+                return
+            if self.next_pwm_time - report_time < read_time < self.next_pwm_time + self.pwm_cycle_time * self.next_pwm_value + 2 * report_time:
+                return
 
             time_diff = read_time - self.last_temp_time
             self.last_temp = temp
             self.last_temp_time = read_time
-
-            if read_time - self._last_control_time >= self.pwm_cycle_time:
-                self.control.temperature_update(read_time, max_t, self.target_temp)
-                self._last_control_time = read_time
-            else:
-                self.set_pwm(read_time, self.last_pwm_value)
 
             temp_diff = temp - self.smoothed_temp
             adj_time = min(time_diff * self.inv_smooth_time, 1.)
@@ -144,8 +163,9 @@ class Heater:
                 "Requested temperature (%.1f) out of range (%.1f:%.1f)"
                 % (degrees, self.min_temp, self.max_temp))
         with self.lock:
-            self._override_pwm = False
+            self._pwm_override_value = -1.
             self.target_temp = degrees
+
     def get_temp(self, eventtime):
         est_print_time = self.mcu_pwm.get_mcu().estimated_print_time(eventtime)
         quell_time = est_print_time - QUELL_STALE_TIME
@@ -153,20 +173,27 @@ class Heater:
             if self.last_temp_time < quell_time:
                 return 0., self.target_temp
             return self.smoothed_temp, self.target_temp
+
+    def is_overridden(self) -> bool:
+        return self._pwm_override_value >= 0.
+
     def check_busy(self, eventtime):
         with self.lock:
-            return self._override_pwm or self.control.check_busy(
+            return self.is_overridden() or self.control.check_busy(
                 eventtime, self.smoothed_temp, self.target_temp)
+
     def set_control(self, control):
         with self.lock:
             old_control = self.control
             self.control = control
             self.target_temp = 0.
         return old_control
+
     def alter_target(self, target_temp):
         if target_temp:
             target_temp = max(self.min_temp, min(self.max_temp, target_temp))
         self.target_temp = target_temp
+
     def stats(self, eventtime):
         est_print_time = self.mcu_pwm.get_mcu().estimated_print_time(eventtime)
         if not self.printer.is_shutdown():
@@ -174,23 +201,29 @@ class Heater:
         with self.lock:
             target_temp = self.target_temp
             last_temp = self.last_temp
-            last_pwm_value = self.last_pwm_value
+            pwm_value = self.next_pwm_value
         is_active = target_temp or last_temp > 50.
         return is_active, '%s: target=%.0f temp=%.1f pwm=%.3f' % (
-            self.short_name, target_temp, last_temp, last_pwm_value)
+            self.short_name, target_temp, last_temp, pwm_value)
+
     def get_status(self, eventtime):
         with self.lock:
             target_temp = self.target_temp
             smoothed_temp = self.smoothed_temp
-            last_pwm_value = self.last_pwm_value
-        return {'temperature': round(smoothed_temp, 2), 'target': target_temp,
-                'power': last_pwm_value}
-    cmd_SET_HEATER_TEMPERATURE_help = "Sets a heater temperature"
-    def cmd_SET_HEATER_TEMPERATURE(self, gcmd):
-        temp = gcmd.get_float('TARGET', 0.)
+            pwm_value = self.next_pwm_value
+        return {'temperature': round(smoothed_temp, 2), 'target': target_temp, 'power': pwm_value}
 
+    def cmd_SET_HEATER_TEMPERATURE(self, gcmd: 'GCodeCommand'):
+        temp = gcmd.get_float('TARGET', 0.)
         pheaters: 'PrinterHeaters' = self.printer.lookup_object('heaters')
         pheaters.set_temperature(self, temp)
+
+    def cmd_HEATER_OVERRIDE(self, gcmd: 'GCodeCommand'):
+        pwm_value = gcmd.get_float('PWM')
+        self.override_pwm_value(pwm_value)
+
+    def cmd_HEATER_OVERRIDE_RELEASE(self, _: 'GCodeCommand'):
+        self.override_pwm_value(-1.)
 
 
 ######################################################################
@@ -203,15 +236,17 @@ class ControlBangBang:
         self.heater_max_power = heater.get_max_power()
         self.max_delta = config.getfloat('max_delta', 2.0, above=0.)
         self.heating = False
-    def temperature_update(self, read_time, temp, target_temp):
+
+    def temperature_update(self, read_time, temp, target_temp) -> float:
         if self.heating and temp >= target_temp+self.max_delta:
             self.heating = False
         elif not self.heating and temp <= target_temp-self.max_delta:
             self.heating = True
         if self.heating:
-            self.heater.set_pwm(read_time, self.heater_max_power)
+            return self.heater_max_power
         else:
-            self.heater.set_pwm(read_time, 0.)
+            return 0
+
     def check_busy(self, eventtime, smoothed_temp, target_temp):
         return smoothed_temp < target_temp-self.max_delta
 
@@ -243,31 +278,34 @@ class ControlPID:
     def set_rate(self, rate):
         self._rate = rate / 3600
 
-    def temperature_update(self, read_time, temp, target_temp):
+    def temperature_update(self, read_time, temp, target_temp) -> float:
         time_diff = read_time - self.prev_temp_time
-        # Calculate change of temperature
+
+        # Calculate change of temperature (D)
         temp_diff = temp - self.prev_temp
         if time_diff >= self.min_deriv_time:
             temp_deriv = temp_diff / time_diff - self._rate
         else:
             temp_deriv = ((self.prev_temp_deriv * (self.min_deriv_time - time_diff)  + temp_diff) /
                           self.min_deriv_time - self._rate)
-        # Calculate accumulated temperature "error"
+
+        # Calculate accumulated temperature "error" (K and I)
         temp_err = target_temp - temp
         temp_integ = self.prev_temp_integ + temp_err * time_diff
         temp_integ = max(0., min(self.temp_integ_max, temp_integ))
+
         # Calculate output
         co = self.Kp*temp_err + self.Ki*temp_integ - self.Kd*temp_deriv
-        #logging.debug("pid: %f@%.3f -> diff=%f deriv=%f err=%f integ=%f co=%d",
-        #    temp, read_time, temp_diff, temp_deriv, temp_err, temp_integ, co)
         bounded_co = max(0., min(self.heater_max_power, co))
-        self.heater.set_pwm(read_time, bounded_co)
+
         # Store state for next measurement
         self.prev_temp = temp
         self.prev_temp_time = read_time
         self.prev_temp_deriv = temp_deriv
         if co == bounded_co:
             self.prev_temp_integ = temp_integ
+
+        return bounded_co
 
     def check_busy(self, eventtime, smoothed_temp, target_temp):
         temp_diff = target_temp - smoothed_temp
