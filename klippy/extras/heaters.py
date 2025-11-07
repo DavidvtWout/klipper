@@ -65,8 +65,6 @@ class Heater:
         self._temperature_readings = dict()
         self.last_temp_time = 0.
         # pwm caching
-        self.last_pwm_time = 0.
-        self.last_pwm_value = 0.
         self.next_pwm_time = 0.
         self.next_pwm_value = 0.
 
@@ -106,7 +104,6 @@ class Heater:
         self.printer.register_event_handler("klippy:shutdown", self._handle_shutdown)
 
     def _handle_connect(self):
-        logging.info(f'Heater {self.name} connected!')
         self.reactor.update_timer(self._pwm_timer, self.reactor.NOW)
 
     def override_pwm_value(self, value):
@@ -117,8 +114,6 @@ class Heater:
     def _pwm_timer_callback(self, eventtime: float):
         print_time = self.mcu_pwm.get_mcu().estimated_print_time(eventtime)
         with self.lock:
-            self.last_pwm_time = self.next_pwm_time
-            self.last_pwm_value = self.next_pwm_value
             self.next_pwm_time = print_time + self.pwm_delay + 0.1
             self.next_pwm_value = self.control.temperature_update(print_time, self.smoothed_temp, self.target_temp)
             if self.is_overridden():
@@ -132,8 +127,6 @@ class Heater:
     def temperature_callback(self, read_time, temp):
         with self.lock:
             report_time = self.sensor.get_report_time_delta()
-            if self.last_pwm_time - report_time < read_time < self.last_pwm_time + self.pwm_cycle_time * self.last_pwm_value + 2 * report_time:
-                return
             if self.next_pwm_time - report_time < read_time < self.next_pwm_time + self.pwm_cycle_time * self.next_pwm_value + 2 * report_time:
                 return
 

@@ -124,7 +124,7 @@ class HeatersScheduler:
                 heater.set_temp(current_target)
         return min(eventtime + self.update_interval, end_time)
 
-    def flush_schedule(self):
+    def flush_schedule(self, _print_time):
         with self.lock:
             self._schedule = []
 
